@@ -4,25 +4,35 @@ import pandas as pd
 import numpy as np
 import logging
 from tqdm import tqdm
-from itertools import combinations
+from itertools import product
 import statsmodels.api as sm
+from datetime import datetime, timedelta
 
 
 # --- Configuration ---
 class Config:
     DATA_DIR = "data"
+    BACKTEST_SUMMARY_FILE = "backtest_summary.xlsx"
+    PLAYBOOK_FILE = "trading_playbook.xlsx"
 
-    # --- Phase 2: Pair Finding Config ---
-    # We now enforce that a pair must have BOTH high correlation AND cointegration
-    CORRELATION_THRESHOLD = 0.95  # Increased for higher quality pairs
-    P_VALUE_THRESHOLD = 0.05
-    MIN_DATAPOINTS = 500
+    # --- Optimization Parameter Ranges ---
+    OPTIMIZER_RANGES = {
+        'z_window': range(14, 49, 7),  # Windows: 14, 21, 28, 35, 42
+        'entry_z': np.arange(1.5, 2.75, 0.25),  # Entries: 1.5, 1.75, 2.0, 2.25, 2.5
+        'exit_z': np.arange(0.0, 1.0, 0.25)  # Exits: 0.0, 0.25, 0.5, 0.75
+    }
 
-    # --- Phase 3: Backtesting Config ---
-    PAIRS_FILE = "high_quality_pairs.csv"  # New output file name
-    ZSCORE_WINDOW = 21
-    ENTRY_THRESHOLD = 2.0
-    EXIT_THRESHOLD = 0.5
+    # --- Watchlist Filtering Criteria ---
+    # These rules will be applied to the backtest_summary file
+    # to select which pairs to include in the final playbook.
+    WATCHLIST_CRITERIA = {
+        # Tier 1: Elite, extremely high-quality strategies
+        'Tier 1': {'min_sharpe': 15.0, 'min_trades': 10, 'max_drawdown': -20},
+        # Tier 2: Core, very strong and reliable strategies
+        'Tier 2': {'min_sharpe': 7.0, 'min_trades': 15, 'max_drawdown': -30},
+        # Tier 3: Good, solid strategies worth monitoring
+        'Tier 3': {'min_sharpe': 5.0, 'min_trades': 20, 'max_drawdown': -40},
+    }
 
 
 # --- Logging Setup ---
@@ -36,204 +46,175 @@ logging.basicConfig(
 )
 
 
-# --- UPGRADED: Phase 2 ---
-class PairFinder:
-    """
-    Finds high-quality pairs that meet BOTH correlation and cointegration thresholds.
-    """
-
-    def __init__(self, config):
-        self.config = config
-        self.output_file = self.config.PAIRS_FILE
-        self.master_df = self._load_all_data()
-        if os.path.exists(self.output_file):
-            os.remove(self.output_file)
-
-    def _load_all_data(self):
-        """Loads all symbol data into a single DataFrame."""
-        logging.info("Loading all symbol data into memory...")
-        files = [f for f in os.listdir(self.config.DATA_DIR) if f.endswith('.csv')]
-        all_series = [
-            pd.read_csv(os.path.join(self.config.DATA_DIR, f), index_col='open_time', parse_dates=True)['close'].rename(
-                f.replace('.csv', ''))
-            for f in tqdm(files, desc="Loading data files")
-        ]
-        if not all_series: return pd.DataFrame()
-        master_df = pd.concat(all_series, axis=1).ffill().astype(np.float32)
-        return master_df
-
-    @staticmethod
-    def check_cointegration(series1, series2):
-        """Performs the cointegration test."""
-        from statsmodels.tsa.stattools import adfuller
-        try:
-            ols_result = sm.OLS(series1, sm.add_constant(series2)).fit()
-            # **FIX**: Using .iloc[1] to explicitly access by position and remove warning.
-            hedge_ratio = ols_result.params.iloc[1]
-            residuals = series1 - hedge_ratio * series2
-            p_value = adfuller(residuals)[1]
-            return p_value
-        except Exception:
-            return 1.0  # Return a high p-value on error
-
-    def find_pairs(self):
-        """Finds pairs that are both highly correlated and cointegrated."""
-        if self.master_df.empty: return
-
-        logging.info("Step 1: Filtering for highly correlated pairs...")
-        corr_matrix = self.master_df.corr()
-        corr_pairs = corr_matrix.unstack()
-        corr_pairs = corr_pairs[corr_pairs.index.get_level_values(0) < corr_pairs.index.get_level_values(1)]
-        candidate_pairs = corr_pairs[corr_pairs > self.config.CORRELATION_THRESHOLD]
-
-        logging.info(
-            f"Found {len(candidate_pairs)} pairs with correlation > {self.config.CORRELATION_THRESHOLD}. Now testing for cointegration.")
-
-        high_quality_pairs = []
-        pbar = tqdm(candidate_pairs.items(), total=len(candidate_pairs), desc="Testing Candidates")
-        for (s1, s2), corr_value in pbar:
-            series1, series2 = self.master_df[s1].dropna(), self.master_df[s2].dropna()
-            aligned_s1, aligned_s2 = series1.align(series2, join='inner')
-
-            if len(aligned_s1) < self.config.MIN_DATAPOINTS: continue
-
-            p_value = self.check_cointegration(aligned_s1, aligned_s2)
-            if p_value < self.config.P_VALUE_THRESHOLD:
-                high_quality_pairs.append({
-                    'symbol1': s1, 'symbol2': s2, 'p_value': p_value, 'correlation': corr_value
-                })
-
-        if high_quality_pairs:
-            results_df = pd.DataFrame(high_quality_pairs).sort_values('p_value')
-            results_df.to_csv(self.output_file, index=False)
-            logging.info(
-                f"--- Pair Finding Finished. Found {len(results_df)} high-quality pairs. Saved to {self.output_file} ---")
-        else:
-            logging.info("--- Pair Finding Finished. No pairs met both criteria. ---")
-
-
-# --- UPGRADED: Phase 3 ---
-class Backtester:
-    """
-    Backtests pairs with robust equity calculation.
-    """
-
-    def __init__(self, config):
-        self.config = config
-        self.pairs_df = self._load_pairs()
-        self.summary_results = []
-
-    def _load_pairs(self):
-        try:
-            df = pd.read_csv(self.config.PAIRS_FILE)
-            logging.info(f"Loaded {len(df)} pairs to backtest from {self.config.PAIRS_FILE}")
-            return df
-        except FileNotFoundError:
-            logging.error(f"Error: Could not find pairs file at {self.config.PAIRS_FILE}. Please run Phase 2 first.")
-            return pd.DataFrame()
-
-    def _load_pair_data(self, s1, s2):
+# --- Re-usable Functions ---
+def load_pair_data(s1, s2, start_date=None):
+    """Loads and aligns price data for a given pair, with an optional start date."""
+    try:
         s1_path = os.path.join(Config.DATA_DIR, f"{s1}.csv")
         s2_path = os.path.join(Config.DATA_DIR, f"{s2}.csv")
         df1 = pd.read_csv(s1_path, index_col='open_time', parse_dates=True)['close'].rename(s1)
         df2 = pd.read_csv(s2_path, index_col='open_time', parse_dates=True)['close'].rename(s2)
-        merged = pd.concat([df1, df2], axis=1).dropna()
+
+        merged = pd.concat([df1, df2], axis=1)
+
+        if start_date:
+            merged = merged[merged.index >= pd.to_datetime(start_date)]
+
+        merged.dropna(inplace=True)
         return merged[s1], merged[s2]
+    except FileNotFoundError:
+        return None, None
 
-    def run_backtest(self):
-        if self.pairs_df.empty: return
-        logging.info("--- Starting Backtesting Process ---")
 
-        pbar = tqdm(self.pairs_df.iterrows(), total=len(self.pairs_df), desc="Backtesting Pairs")
-        for _, row in pbar:
-            s1, s2 = row['symbol1'], row['symbol2']
-            pbar.set_description(f"Backtesting {s1}-{s2}")
+class Backtester:
+    """Runs a single backtest with a given set of parameters."""
 
-            series1, series2 = self._load_pair_data(s1, s2)
-
+    @staticmethod
+    def run(series1, series2, z_window, entry_z, exit_z):
+        """Runs the core backtest logic and returns key metrics."""
+        try:
             model = sm.OLS(series1, sm.add_constant(series2)).fit()
-            # **FIX**: Using .iloc[1] to explicitly access by position and remove warning.
             hedge_ratio = model.params.iloc[1]
             spread = series1 - hedge_ratio * series2
 
-            spread_mean = spread.rolling(window=self.config.ZSCORE_WINDOW).mean()
-            spread_std = spread.rolling(window=self.config.ZSCORE_WINDOW).std()
+            spread_mean = spread.rolling(window=z_window).mean()
+            spread_std = spread.rolling(window=z_window).std()
             z_score = (spread - spread_mean) / spread_std
 
             equity = [1.0]
             in_position = None
-            trades, wins = 0, 0
+            trades = 0
 
             for i in range(1, len(z_score)):
-                # **ROBUST EQUITY CALCULATION**
                 pnl = 0
                 if in_position is not None:
                     risk_unit = spread_std.iloc[i - 1]
-                    if risk_unit > 1e-9:
-                        pnl = (spread.iloc[i] - spread.iloc[i - 1]) / risk_unit
-                    if in_position == 'short':
-                        pnl = -pnl
+                    if risk_unit > 1e-9: pnl = (spread.iloc[i] - spread.iloc[i - 1]) / risk_unit
+                    if in_position == 'short': pnl = -pnl
 
-                period_return = 0.01 * pnl
+                period_return = 0.01 * np.clip(pnl, -5, 5)
                 equity.append(equity[-1] * (1 + period_return))
 
-                # Trading Logic
                 current_z = z_score.iloc[i]
                 if not in_position:
-                    if current_z < -self.config.ENTRY_THRESHOLD:
-                        in_position = 'long';
-                        entry_price = spread.iloc[i]
-                    elif current_z > self.config.ENTRY_THRESHOLD:
-                        in_position = 'short';
-                        entry_price = spread.iloc[i]
-                elif (in_position == 'long' and current_z >= -self.config.EXIT_THRESHOLD) or \
-                        (in_position == 'short' and current_z <= self.config.EXIT_THRESHOLD):
-                    trades += 1
-                    if (in_position == 'long' and spread.iloc[i] > entry_price) or \
-                            (in_position == 'short' and spread.iloc[i] < entry_price):
-                        wins += 1
+                    if current_z < -entry_z:
+                        in_position = 'long'
+                    elif current_z > entry_z:
+                        in_position = 'short'
+                elif (in_position == 'long' and current_z >= -exit_z) or \
+                        (in_position == 'short' and current_z <= exit_z):
+                    trades += 1;
                     in_position = None
 
             returns = pd.Series(equity).pct_change().dropna()
-            total_return = (equity[-1] - 1) * 100
             sharpe_ratio = (returns.mean() / returns.std()) * np.sqrt(365 * 24) if returns.std() > 1e-9 else 0
 
-            peak = pd.Series(equity).expanding(min_periods=1).max()
-            drawdown = ((pd.Series(equity) - peak) / peak).min() * 100
-            win_rate = (wins / trades) * 100 if trades > 0 else 0
+            return sharpe_ratio, trades
+        except Exception:
+            return -99, 0
 
-            self.summary_results.append({
-                'Symbol 1': s1, 'Symbol 2': s2, 'P-Value': row['p_value'],
-                'Correlation': f"{row['correlation']:.4f}", 'Total Return (%)': f"{total_return:.2f}",
-                'Sharpe Ratio': f"{sharpe_ratio:.2f}", 'Max Drawdown (%)': f"{drawdown:.2f}",
-                'Win Rate (%)': f"{win_rate:.2f}", 'Total Trades': trades
+
+class PlaybookGenerator:
+    """
+    Filters the backtest summary to create a tiered watchlist, then optimizes
+    each pair on the list to generate a final trading playbook.
+    """
+
+    def __init__(self, config):
+        self.config = config
+        self.param_ranges = self.config.OPTIMIZER_RANGES
+        self.watchlist = self._create_watchlist()
+        if os.path.exists(self.config.PLAYBOOK_FILE):
+            os.remove(self.config.PLAYBOOK_FILE)
+
+    def _create_watchlist(self):
+        """Filters the backtest summary based on tiered criteria."""
+        try:
+            df = pd.read_excel(self.config.BACKTEST_SUMMARY_FILE)
+            logging.info(f"Loaded {len(df)} backtested pairs from {self.config.BACKTEST_SUMMARY_FILE}")
+        except FileNotFoundError:
+            logging.error(f"Error: Backtest summary file not found at {self.config.BACKTEST_SUMMARY_FILE}")
+            return pd.DataFrame()
+
+        df_filtered = pd.DataFrame()
+        for tier, criteria in self.config.WATCHLIST_CRITERIA.items():
+            tier_df = df[
+                (df['Sharpe Ratio'] >= criteria['min_sharpe']) &
+                (df['Total Trades'] >= criteria['min_trades']) &
+                (df['Max Drawdown (%)'] >= criteria['max_drawdown'])
+                ].copy()
+            tier_df['Tier'] = tier
+            df_filtered = pd.concat([df_filtered, tier_df])
+
+        # Remove duplicates, keeping the one from the highest tier
+        df_filtered.drop_duplicates(subset=['Symbol 1', 'Symbol 2'], keep='first', inplace=True)
+
+        logging.info(
+            f"Created watchlist with {len(df_filtered)} high-quality pairs across {len(self.config.WATCHLIST_CRITERIA)} tiers.")
+        return df_filtered
+
+    def generate_playbook(self):
+        """
+        Loops through the watchlist, optimizes each pair, and saves the results.
+        """
+        if self.watchlist.empty:
+            logging.warning("Watchlist is empty. Cannot generate playbook.")
+            return
+
+        playbook_results = []
+
+        pbar = tqdm(self.watchlist.iterrows(), total=len(self.watchlist), desc="Generating Playbook")
+        for _, row in pbar:
+            s1, s2 = row['Symbol 1'], row['Symbol 2']
+            pbar.set_description(f"Optimizing {s1}-{s2}")
+
+            series1, series2 = load_pair_data(s1, s2)
+            if series1 is None: continue
+
+            param_combinations = list(product(
+                self.param_ranges['z_window'], self.param_ranges['entry_z'], self.param_ranges['exit_z']
+            ))
+
+            best_sharpe = -float('inf')
+            best_params = {}
+
+            for params in param_combinations:
+                z_win, entry_z, exit_z = params
+                sharpe, _ = Backtester.run(series1, series2, z_win, entry_z, exit_z)
+                if sharpe > best_sharpe:
+                    best_sharpe = sharpe
+                    best_params = {'z_window': z_win, 'entry_z': entry_z, 'exit_z': exit_z}
+
+            if not best_params: continue
+
+            # --- Validation Step ---
+            six_months_ago = (datetime.now() - timedelta(days=180)).strftime('%Y-%m-%d')
+            val_s1, val_s2 = load_pair_data(s1, s2, start_date=six_months_ago)
+            val_sharpe, val_trades = -99, 0
+            if val_s1 is not None and len(val_s1) > best_params['z_window']:
+                val_sharpe, val_trades = Backtester.run(val_s1, val_s2, **best_params)
+
+            playbook_results.append({
+                'Tier': row['Tier'],
+                'Symbol 1': s1, 'Symbol 2': s2,
+                'Optimal Z-Window': best_params['z_window'],
+                'Optimal Entry-Z': best_params['entry_z'],
+                'Optimal Exit-Z': best_params['exit_z'],
+                'Best Sharpe (Full History)': f"{best_sharpe:.2f}",
+                'Validation Sharpe (6m)': f"{val_sharpe:.2f}",
+                'Validation Trades (6m)': val_trades
             })
 
-        self._generate_report()
-
-    def _generate_report(self):
-        if not self.summary_results: return
-        summary_df = pd.DataFrame(self.summary_results)
-        numeric_cols = ['Sharpe Ratio', 'Total Return (%)', 'Max Drawdown (%)']
-        for col in numeric_cols:
-            summary_df[col] = pd.to_numeric(summary_df[col], errors='coerce')
-        summary_df.sort_values(by='Sharpe Ratio', ascending=False, inplace=True)
-
-        output_file = 'backtest_summary.xlsx'
-        # Install 'openpyxl' to write to .xlsx files
-        summary_df.to_excel(output_file, sheet_name='Backtest Summary', index=False)
-        logging.info(f"Successfully generated backtest report: {output_file}")
+        # Save the final playbook
+        playbook_df = pd.DataFrame(playbook_results)
+        playbook_df.to_excel(self.config.PLAYBOOK_FILE, index=False, sheet_name="Trading Playbook")
+        logging.info(f"--- Playbook Generation Complete. Saved to {self.config.PLAYBOOK_FILE} ---")
 
 
 if __name__ == '__main__':
     config = Config()
 
-    # --- STEP 1: Run this part first to find the pairs ---
-    # Make sure this is uncommented to generate the new high_quality_pairs.csv
-    # finder = PairFinder(config)
-    # finder.find_pairs()
-
-    # --- STEP 2: Once Step 1 is done, comment it out and run this part ---
-    # Make sure this is commented out on the first run, then uncomment for the second run.
-    backtester = Backtester(config)
-    backtester.run_backtest()
+    # This script now runs the entire final step automatically.
+    # It assumes 'backtest_summary.xlsx' exists.
+    playbook_generator = PlaybookGenerator(config)
+    playbook_generator.generate_playbook()

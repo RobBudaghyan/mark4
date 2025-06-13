@@ -1,3 +1,1 @@
-2025-06-13 19:21:36,994 - INFO - Loaded 2282 pairs to backtest from high_quality_pairs.csv
-2025-06-13 19:21:36,994 - INFO - --- Starting Backtesting Process ---
-2025-06-13 19:27:43,324 - INFO - Successfully generated backtest report: backtest_summary.xlsx
+2025-06-13 20:14:18,412 - INFO - Loaded 56 strategies from playbook: trading_playbook.xlsx
